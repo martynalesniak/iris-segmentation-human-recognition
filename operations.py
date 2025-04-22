@@ -20,6 +20,33 @@ def binarization(image, factor):
     binary = np.where(gray >= threshold, 255, 0)
     return binary.astype(np.uint8)
 
+
+def binarization_roi(image, center, inner_r, outer_r, factor):
+    """
+    Mean‑based threshold over the ring between inner_r and outer_r.
+      - center: (x,y) pupil/iris center
+      - inner_r: radius to exclude (e.g. pupil radius)
+      - outer_r: radius to include (e.g. iris radius)
+      - factor: X_I or X_P from spec
+    """
+    gray = grayscale(image)
+    h, w = gray.shape
+    # build a boolean mask for the annulus
+    yy, xx = np.ogrid[:h, :w]
+    dist2 = (xx - center[0])**2 + (yy - center[1])**2
+    ring_mask = (dist2 >= inner_r**2) & (dist2 <= outer_r**2)
+
+    # compute P over just that ring
+    P = np.mean(gray[ring_mask])
+    threshold = P / factor
+
+    # apply threshold
+    binary = np.zeros_like(gray, dtype=np.uint8)
+    binary[gray < threshold] = 255    # dark region = white
+    # leaving other pixels black
+    return binary
+
+
 def erosion(img, kernel):
     h, w = img.shape
     kh, kw = kernel.shape
