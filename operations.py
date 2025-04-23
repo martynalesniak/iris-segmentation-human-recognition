@@ -1,131 +1,164 @@
 import numpy as np
-import cv2
 
-def load_image(image_path):
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return image
+# -------------------- basic helpers -------------------------------------
 
 def grayscale(image):
     if image.ndim == 2:
         return image
     weights = np.array([0.114, 0.587, 0.299])
-    gray = np.dot(image[..., :3], weights)
-    return gray.astype(np.uint8)
+    return (image[..., :3] @ weights).astype(np.uint8)
+
 
 def binarization(image, factor):
     gray = grayscale(image)
     P = np.mean(gray)
-    threshold = P / factor
-    binary = np.where(gray >= threshold, 255, 0)
-    return binary.astype(np.uint8)
+    thr = P / factor
+    out = np.where(gray < thr, 255, 0).astype(np.uint8)  # dark = foreground
+    return out
+
+def _logical_shift(img_bool: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Return a view of img_bool shifted by (dy,dx) with zero padding."""
+    h, w = img_bool.shape
+    # y slice
+    if dy < 0:
+        ys = slice(0, h + dy)
+        yt = slice(-dy, h)
+    elif dy > 0:
+        ys = slice(dy, h)
+        yt = slice(0, h - dy)
+    else:
+        ys = yt = slice(0, h)
+    # x slice
+    if dx < 0:
+        xs = slice(0, w + dx)
+        xt = slice(-dx, w)
+    elif dx > 0:
+        xs = slice(dx, w)
+        xt = slice(0, w - dx)
+    else:
+        xs = xt = slice(0, w)
+
+    out = np.zeros_like(img_bool)
+    out[yt, xt] = img_bool[ys, xs]
+    return out
 
 
-def binarization_roi(image, center, inner_r, outer_r, factor):
-    """
-    Mean‑based threshold over the ring between inner_r and outer_r.
-      - center: (x,y) pupil/iris center
-      - inner_r: radius to exclude (e.g. pupil radius)
-      - outer_r: radius to include (e.g. iris radius)
-      - factor: X_I or X_P from spec
-    """
-    gray = grayscale(image)
-    h, w = gray.shape
-    # build a boolean mask for the annulus
+def dilatation(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    fg = (img == 255)
+    ky, kx = np.where(kernel == 1)
+    cy, cx = kernel.shape[0] // 2, kernel.shape[1] // 2
+    acc = np.zeros_like(fg)
+    for dy, dx in zip(ky - cy, kx - cx):
+        acc |= _logical_shift(fg, dy, dx)
+    return acc.astype(np.uint8) * 255
+
+
+def erosion(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    fg = (img == 255)
+    ky, kx = np.where(kernel == 1)
+    cy, cx = kernel.shape[0] // 2, kernel.shape[1] // 2
+    acc = np.ones_like(fg)
+    for dy, dx in zip(ky - cy, kx - cx):
+        acc &= _logical_shift(fg, dy, dx)
+    return acc.astype(np.uint8) * 255
+
+def opening(mask, k):
+    return dilatation(erosion(mask, k), k)
+
+def closing(mask, k):
+    return erosion(dilatation(mask, k), k)
+
+def refine_circle_and_score(bin_mask: np.ndarray):
+    if bin_mask.ndim != 2:
+        raise ValueError("binary mask must be 2‑D")
+
+    fg = bin_mask // 255
+    if fg.sum() == 0:
+        h, w = bin_mask.shape
+        return np.zeros((h, w), dtype=np.uint8), 0.0
+
+    # centre via projections (same method as UI)
+    proj_y = np.sum(fg, axis=1)
+    rows = np.where(proj_y > 0)[0]
+    proj_x = np.sum(fg, axis=0)
+    cols = np.where(proj_x > 0)[0]
+    cy = (rows[0] + rows[-1]) // 2
+    cx = (cols[0] + cols[-1]) // 2
+    ry = (rows[-1] - rows[0]) / 2.0
+    rx = (cols[-1] - cols[0]) / 2.0
+    r  = (ry + rx) / 2.0
+
+    # build ideal circle mask (NumPy broadcasting)
+    h, w = bin_mask.shape
     yy, xx = np.ogrid[:h, :w]
-    dist2 = (xx - center[0])**2 + (yy - center[1])**2
-    ring_mask = (dist2 >= inner_r**2) & (dist2 <= outer_r**2)
+    circle = ((xx - cx) ** 2 + (yy - cy) ** 2) <= r ** 2
+    ideal = circle.astype(np.uint8) * 255
 
-    # compute P over just that ring
-    P = np.mean(gray[ring_mask])
-    threshold = P / factor
+    # Jaccard score (intersection / union)
+    inter = np.logical_and(fg, circle).sum()
+    union = np.logical_or(fg, circle).sum()
+    score = inter / union if union else 0.0
 
-    # apply threshold
-    binary = np.zeros_like(gray, dtype=np.uint8)
-    binary[gray < threshold] = 255    # dark region = white
-    # leaving other pixels black
-    return binary
+    return ideal, score
+
+# -------------------- hole-filling & closing ----------------------------
+def close_and_fill(binary: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Morphological closing (dilation→erosion) then flood-fill to fill holes."""
+    closed = erosion(dilatation(binary, kernel), kernel)
+
+    # flood-fill 0-pixels connected to the border → background mask
+    h, w = closed.shape
+    bg = np.zeros_like(closed, dtype=bool)
+    stack = [(0, x) for x in range(w) if closed[0, x] == 0] + \
+            [(h-1, x) for x in range(w) if closed[h-1, x] == 0] + \
+            [(y, 0) for y in range(h) if closed[y, 0] == 0] + \
+            [(y, w-1) for y in range(h) if closed[y, w-1] == 0]
+
+    while stack:
+        y, x = stack.pop()
+        if bg[y, x]:
+            continue
+        bg[y, x] = True
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and closed[ny, nx] == 0 and not bg[ny, nx]:
+                    stack.append((ny, nx))
+
+    holes = (~bg) & (closed == 0)
+    filled = closed.copy()
+    filled[holes] = 255
+    return filled
 
 
-def erosion(img, kernel):
-    h, w = img.shape
-    kh, kw = kernel.shape
-    pad_h = kh // 2
-    pad_w = kw // 2
-    
-    padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='constant', constant_values=255)
-    output = np.zeros_like(img)
+# -------------------- projection helpers --------------------------------
 
-    for i in range(h):
-        for j in range(w):
-            region = padded[i:i+kh, j:j+kw]
-            if np.array_equal(region[kernel == 1], 255 * np.ones(np.sum(kernel))):
-                output[i, j] = 255
-            else:
-                output[i, j] = 0
-    return output
-
-def dilatation(img, kernel):
-    h, w = img.shape
-    kh, kw = kernel.shape
-    pad_h = kh // 2
-    pad_w = kw // 2
-    
-    padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='constant', constant_values=0)
-    output = np.zeros_like(img)
-
-    for i in range(h):
-        for j in range(w):
-            region = padded[i:i+kh, j:j+kw]
-            if np.any(region[kernel == 1] == 255):
-                output[i, j] = 255
-            else:
-                output[i, j] = 0
-    return output
-
-def horizontal_projection(image, factor):
-    binary = binarization(image, factor)
-    binary[binary == 0] = 1
-    binary[binary == 255] = 0
-
-    projection = np.sum(binary, axis=1)
-    max_val = np.max(projection)
-    threshold = 0.7 * max_val  # 70% maksimum jako próg
-
-    indices = np.where(projection >= threshold)[0]
-    if len(indices) > 0:
-        height = indices[-1] - indices[0]
-        center_y = (indices[-1] + indices[0]) // 2
-        radius_y = height // 2
+def _projection(binary, axis):
+    proj = np.sum(binary // 255, axis=axis)
+    max_val = proj.max()
+    thresh = 0.7 * max_val
+    idx = np.where(proj >= thresh)[0]
+    if idx.size:
+        length = idx[-1] - idx[0]
+        center = (idx[-1] + idx[0]) // 2
+        radius = length // 2
     else:
-        center_y = np.argmax(projection)
-        radius_y = 0  # fallback
-
-    return center_y, radius_y
-
-def vertical_projection(image, factor):
-    binary = binarization(image, factor)
-    binary[binary == 0] = 1
-    binary[binary == 255] = 0
-
-    projection = np.sum(binary, axis=0)
-    max_val = np.max(projection)
-    threshold = 0.7 * max_val
-
-    indices = np.where(projection >= threshold)[0]
-    if len(indices) > 0:
-        width = indices[-1] - indices[0]
-        center_x = (indices[-1] + indices[0]) // 2
-        radius_x = width // 2
-    else:
-        center_x = np.argmax(projection)
-        radius_x = 0
-
-    return center_x, radius_x
+        center = proj.argmax()
+        radius = 0
+    return center, radius
 
 
+def horizontal_projection(binary, factor):
+    return _projection(binary, axis=1)
 
-def polar_to_cartesian(r, theta, center_x, center_y):
-    x = int(r * np.cos(theta) + center_x)
-    y = int(r * np.sin(theta) + center_y)
+
+def vertical_projection(binary, factor):
+    return _projection(binary, axis=0)
+
+
+# ----------------------- polar helper -----------------------------------
+
+def polar_to_cartesian(r, theta, cx, cy):
+    x = int(r * np.cos(theta) + cx)
+    y = int(r * np.sin(theta) + cy)
     return x, y
