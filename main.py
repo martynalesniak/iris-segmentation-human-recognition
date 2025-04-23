@@ -17,6 +17,69 @@ from operations import (
 
 # ---------------- helper -------------------------------------------------
 
+def detect_iris_from_pupil(gray_image, pupil_center, pupil_radius):
+    """Wykrywa tęczówkę metodą gradientową, startując od krawędzi źrenicy."""
+    h, w = gray_image.shape
+    max_search_radius = int(pupil_radius * 3.2)  # Maksymalny promień poszukiwań
+    
+    # Przygotowanie tablicy na profile intensywności
+    num_angles = 36  # Liczba kierunków próbkowania
+    angles = np.linspace(0, 2*np.pi, num_angles, endpoint=False)
+    iris_radius_estimates = []
+    
+    # Dla każdego kąta
+    for angle in angles:
+        # Współrzędne wektora kierunkowego
+        dx, dy = np.cos(angle), np.sin(angle)
+        
+        # Tablica na profil intensywności dla tego kąta
+        intensity_profile = []
+        radius_values = []
+        
+        # Próbkuj punkty wzdłuż promienia
+        for r in range(pupil_radius + 5, max_search_radius, 2):  # Zacznij poza źrenicą
+            # Oblicz współrzędne punktu
+            x = int(pupil_center[0] + dx * r)
+            y = int(pupil_center[1] + dy * r)
+            
+            # Sprawdź czy punkt jest w granicach obrazu
+            if 0 <= x < w and 0 <= y < h:
+                intensity = gray_image[y, x]
+                intensity_profile.append(intensity)
+                radius_values.append(r)
+        
+        # Jeśli zebraliśmy wystarczająco próbek
+        if len(intensity_profile) > 10:
+            # Wygładź profil intensywności
+            smoothed = np.convolve(intensity_profile, np.ones(5)/5, mode='valid')
+            
+            # Oblicz gradient (pierwszą pochodną) intensywności
+            gradient = np.gradient(smoothed)
+            
+            # Znajdź indeks maksymalnej zmiany gradientu (to może wskazywać granicę tęczówki)
+            # Szukamy tylko w sensownym zakresie (pomijamy początek i koniec profilu)
+            search_range = len(gradient) // 3  # Pomiń pierwszy 1/3 profilu
+            if search_range < len(gradient):
+                # Znajdź pozycję największej zmiany intensywności
+                max_grad_idx = search_range + np.argmax(np.abs(gradient[search_range:]))
+                if max_grad_idx < len(radius_values):
+                    # Dodaj estymację promienia tęczówki
+                    iris_radius_estimates.append(radius_values[max_grad_idx])
+    
+    # Usuń skrajne wartości i oblicz średnią
+    if iris_radius_estimates:
+        # Usuń 20% skrajnych wartości
+        sorted_estimates = sorted(iris_radius_estimates)
+        num_to_remove = len(sorted_estimates) // 5
+        filtered_estimates = sorted_estimates[num_to_remove:-num_to_remove] if num_to_remove > 0 else sorted_estimates
+        
+        # Średnia z pozostałych estymacji
+        iris_radius = int(np.mean(filtered_estimates))
+        return iris_radius
+    else:
+        # Jeśli nie znaleziono estymacji, zwróć domyślną wartość
+        return int(pupil_radius * 2.5)
+    
 def binarization_ring(image, center, inner_r, outer_r, factor):
     """Mean‑based threshold inside an annulus (pure NumPy)."""
     gray = grayscale(image)
@@ -109,6 +172,59 @@ class IrisUI(QMainWindow):
         pix = cv_to_qpixmap(img).scaled(self.max_w, self.max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.labels[slot].setPixmap(pix)
 
+    def remove_eyelids(self, image, iris_center, iris_radius):
+        """Prosta metoda usuwania powiek przez wycięcie stałych segmentów
+        górnej i dolnej części tęczówki.
+        """
+        # Stwórz kopię obrazu
+        result = image.copy()
+        h, w = image.shape[:2]
+        
+        # Utwórz pustą maskę
+        eyelid_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Podziel tęczówkę na segmenty
+        angle_step = 20  # W stopniach
+        
+        # Usuwamy górną część (od -60° do 60°)
+        for angle in range(-60, 61, angle_step):
+            rad = np.radians(angle)
+            start_x = int(iris_center[0] + (iris_radius * 0.3) * np.cos(rad))
+            start_y = int(iris_center[1] + (iris_radius * 0.3) * np.sin(rad))
+            end_x = int(iris_center[0] + iris_radius * np.cos(rad))
+            end_y = int(iris_center[1] + iris_radius * np.sin(rad))
+            
+            # Rysuj linie od środka tęczówki do jej krawędzi
+            cv2.line(eyelid_mask, (start_x, start_y), (end_x, end_y), 255, 2)
+        
+        # Usuwamy dolną część (od 120° do 240°)
+        for angle in range(120, 241, angle_step):
+            rad = np.radians(angle)
+            start_x = int(iris_center[0] + (iris_radius * 0.3) * np.cos(rad))
+            start_y = int(iris_center[1] + (iris_radius * 0.3) * np.sin(rad))
+            end_x = int(iris_center[0] + iris_radius * np.cos(rad))
+            end_y = int(iris_center[1] + iris_radius * np.sin(rad))
+            
+            # Rysuj linie od środka tęczówki do jej krawędzi
+            cv2.line(eyelid_mask, (start_x, start_y), (end_x, end_y), 255, 2)
+        
+        # Rozszerz maskę, aby utworzyć większe obszary do usunięcia
+        kernel = np.ones((7, 7), np.uint8)
+        eyelid_mask = cv2.dilate(eyelid_mask, kernel, iterations=3)
+        
+        # Zastosuj maskę do obrazu
+        if len(image.shape) > 2:  # Obraz kolorowy
+            # Rozszerz maskę do 3 kanałów
+            eyelid_mask_color = cv2.merge([eyelid_mask, eyelid_mask, eyelid_mask])
+            
+            # Zastąp obszary powiek białym kolorem
+            white_bg = np.ones_like(result) * 255
+            result = np.where(eyelid_mask_color > 0, white_bg, result)
+        else:  # Obraz w skali szarości
+            # Zastąp obszary powiek białym kolorem
+            result[eyelid_mask > 0] = 255
+        
+        return result, cv2.bitwise_not(eyelid_mask)
     # ------------- pupil processing -------------------------------------
 
     def _compute_pupil(self):
@@ -177,70 +293,26 @@ class IrisUI(QMainWindow):
     def _compute_iris(self):
         if self.pcen is None: self._compute_pupil()
         
-        # Estymacja promienia tęczówki jako 3x promień źrenicy (powiększenie o 3x)
-        est_irad = int(self.prad * 2.0)
+        # Wykorzystaj funkcję detekcji tęczówki od źrenicy
+        self.irad = detect_iris_from_pupil(self.gray, self.pcen, self.prad)
+        self.ircen = self.pcen  # Zazwyczaj środek tęczówki jest bardzo zbliżony do środka źrenicy
         
-        best_score = 0
-        best_mask = None
-        factors = [i / 10 for i in range(5, 30, 3)]
-        kernel = np.ones((5, 5), np.uint8)
-
-        # Iteracja przez faktory, aby znaleźć najlepszą maskę tęczówki
-        for f in factors:
-            # Binarne progowanie w pierścieniu między źrenicą a tęczówką
-            ring_bin = binarization_ring(self.orig_no_pupil, self.pcen, int(self.prad * 1.2), est_irad, factor=f)
-            
-            # Operacje morfologiczne: oczyszczenie przez otwieranie i zamykanie
-            opened = dilatation(erosion(ring_bin, kernel), kernel)
-            closed = erosion(dilatation(opened, kernel), kernel)
-            
-            # Sprawdzenie największej składowej połączonej
-            lcc = largest_connected_component(closed)
-            mask = (lcc * 255).astype(np.uint8)
-            
-            # Ocena skuteczności maski na podstawie cyrkularności
-            score = circularity_and_completeness(mask)
-            if score > best_score:
-                best_score = score
-                best_mask = mask
-            print(score, f)
+        # Tworzenie maski tęczówki
+        h, w = self.gray.shape
+        yy, xx = np.ogrid[:h, :w]
         
-        # Przechowywanie najlepszej maski tęczówki
-        self.bin_iris = best_mask
-
-        # Obliczanie średnicy tęczówki (na podstawie projekcji poziomej i pionowej)
-        proj_y = np.sum(best_mask // 255, axis=1)
-        rows = np.where(proj_y > 0)[0]
-        proj_x = np.sum(best_mask // 255, axis=0)
-        cols = np.where(proj_x > 0)[0]
-
-        if rows.size == 0 or cols.size == 0:
-            self.irad = 0
-            return
-
-        # Obliczamy środek i promień tęczówki
-        cy = (rows[0] + rows[-1]) // 2
-        ry = (rows[-1] - rows[0]) // 2
-        cx = (cols[0] + cols[-1]) // 2
-        rx = (cols[-1] - cols[0]) // 2
-
-        self.irad = (ry + rx) // 2  # Promień tęczówki
-        self.ircen = (cx, cy)  # Środek tęczówki
-
-        # --- Tworzenie maski okręgu (czysta NumPy) ---
-        rr, cc = np.ogrid[:best_mask.shape[0], :best_mask.shape[1]]
-        mask_circle = (rr - cy) ** 2 + (cc - cx) ** 2 <= (self.irad + 5) ** 2  # Margin 5 dla rozszerzenia promienia
-        final_mask = np.zeros_like(best_mask, dtype=np.uint8)
-        final_mask[mask_circle] = 255  # Maska binarna z okręgiem tęczówki
-
-        # Przechowywanie ostatecznej maski tęczówki
-        self.bin_iris = final_mask
-
+        # Maska pierścieniowa tęczówki (między źrenicą a granicą tęczówki)
+        iris_disk = (xx - self.pcen[0])**2 + (yy - self.pcen[1])**2 <= self.irad**2
+        pupil_disk = (xx - self.pcen[0])**2 + (yy - self.pcen[1])**2 <= self.prad**2
+        iris_ring = iris_disk & (~pupil_disk)
+        
+        # Stwórz obraz binarny
+        self.bin_iris = np.zeros((h, w), dtype=np.uint8)
+        self.bin_iris[iris_ring] = 255
+        
         # Wizualizacja: rysowanie okręgu na obrazie tęczówki
         self.overlay_iris = self.orig.copy()
-        cv2.circle(self.overlay_iris, self.ircen, self.irad, (0, 255, 0), 2)  # Rysowanie zielonego okręgu tęczówki
-
-
+        cv2.circle(self.overlay_iris, self.pcen, self.irad, (0, 255, 0), 2)  # Zielony okrąg tęczówki
 
     def _compute_both_overlay(self):
         if self.irad is None: self._compute_iris()
@@ -251,17 +323,37 @@ class IrisUI(QMainWindow):
     # ------------- unwrap ------------------------------------------------
     def _compute_unwrap(self):
         if self.irad is None: self._compute_iris()
-        h_res, w_res = 64, 512
+        
+        # Standardowe wymiary dla unwrappowanej tęczówki
+        # Wysokość = odległość między źrenicą a krawędzią tęczówki
+        # Szerokość = wystarczająca rozdzielczość dla obwodu
+        h_res = min(64, max(32, int(self.irad - self.prad)))  # Między 32 a 64 pikseli
+        avg_radius = (self.prad + self.irad) / 2
+        w_res = min(512, max(256, int(2 * np.pi * avg_radius)))  # Między 256 a 512 pikseli
+        
+        # Kąty próbkowania (pełny okrąg)
         thetas = np.linspace(0, 2 * np.pi, w_res, endpoint=False)
+        
+        # Promienie próbkowania (od źrenicy do tęczówki)
         rs = np.linspace(self.prad, self.irad, h_res)
-        un = np.zeros((h_res, w_res), dtype=np.uint8)
+        
+        # Przygotuj pusty obraz kolorowy na unwrappowaną tęczówkę
+        # Dla obrazu kolorowego potrzebujemy 3 kanałów
+        unwrapped = np.zeros((h_res, w_res, 3), dtype=np.uint8)
+        
+        # Dla każdego promienia
         for i, r in enumerate(rs):
+            # Oblicz współrzędne punktów wzdłuż okręgu dla tego promienia
             x = (r * np.cos(thetas) + self.pcen[0]).astype(int)
             y = (r * np.sin(thetas) + self.pcen[1]).astype(int)
-            valid = (x >= 0) & (x < self.gray.shape[1]) & (y >= 0) & (y < self.gray.shape[0])
-            un[i, valid] = self.gray[y[valid], x[valid]]
-        self.unwrapped = un
-
+            
+            # Sprawdź, które punkty są w granicach obrazu
+            valid = (x >= 0) & (x < self.orig.shape[1]) & (y >= 0) & (y < self.orig.shape[0])
+            
+            # Kopiuj wartości pikseli z oryginalnego obrazu do unwrappowanego
+            unwrapped[i, valid] = self.orig[y[valid], x[valid]]
+        
+        self.unwrapped = unwrapped
 
 # ----------------------------- run --------------------------------------
 if __name__ == "__main__":
