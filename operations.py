@@ -101,6 +101,64 @@ def refine_circle_and_score(bin_mask: np.ndarray):
 
     return ideal, score
 
+
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+
+def extract_contour(binary):
+    """
+    Vectorized: external contour = foreground pixels (A==1)
+    that have at least one 4‐neighbour background pixel.
+    """
+    A = (binary > 0).astype(np.uint8)
+    up    = np.pad(A, ((1,0),(0,0)))[:-1, :]
+    down  = np.pad(A, ((0,1),(0,0)))[1: , :]
+    left  = np.pad(A, ((0,0),(1,0)))[:, :-1]
+    right = np.pad(A, ((0,0),(0,1)))[:, 1: ]
+    bg_n = (up==0)|(down==0)|(left==0)|(right==0)
+    return (A==1) & bg_n
+
+def circularity_and_completeness(binary):
+    """
+    Returns a combined score ∈ [0,1]:
+      score = (min_r/max_r) * angular_coverage.
+
+    - min_r/max_r penalizes radial irregularity.
+    - angular_coverage = 1 - (largest empty angle)/(2π).
+    """
+    cnt = extract_contour(binary)
+    ys, xs = np.nonzero(cnt)
+    if xs.size < 5:
+        return 0.0
+
+    # centroid
+    cx, cy = xs.mean(), ys.mean()
+    # radii
+    rs = np.hypot(xs - cx, ys - cy)
+    rmin, rmax = rs.min(), rs.max()
+    circ = rmin/rmax
+
+    # angles in [0,2π)
+    ang = np.mod(np.arctan2(ys-cy, xs-cx), 2*np.pi)
+    sa = np.sort(ang)
+    # compute gaps between successive angles (with wrap)
+    gaps = np.diff(np.concatenate([sa, sa[:1] + 2*np.pi]))
+    largest_gap = gaps.max()
+    coverage = 1 - largest_gap/(2*np.pi)
+
+    return float(circ * coverage)
+
+
+
+# --- Usage Example ---
+# import imageio
+# bin1 = imageio.imread('/mnt/data/7d833d2a-537f-4cb3-ab47-e06c4293dcf4.png')
+# bin2 = imageio.imread('/mnt/data/c0ee743b-9937-4778-908f-301bd0eaf16e.png')
+# print("Score1:", circle_score(bin1))
+# print("Score2:", circle_score(bin2))
+
+
 # -------------------- hole-filling & closing ----------------------------
 def close_and_fill(binary: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """Morphological closing (dilation→erosion) then flood-fill to fill holes."""

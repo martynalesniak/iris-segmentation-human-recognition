@@ -11,7 +11,8 @@ from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt
 from operations import (
     grayscale, binarization, erosion, dilatation, opening, closing,
-    horizontal_projection, vertical_projection, polar_to_cartesian, close_and_fill, refine_circle_and_score
+    horizontal_projection, vertical_projection, polar_to_cartesian, close_and_fill, refine_circle_and_score,
+    circularity_and_completeness
 )
 
 # ---------------- helper -------------------------------------------------
@@ -152,7 +153,7 @@ class IrisUI(QMainWindow):
             mask_opening_closing = closing(mask_opening, k)
             mask_opening_closing_llc = self._largest_connected_component(mask_opening_closing)
             mask = (mask_opening_closing_llc * 255).astype(np.uint8)
-            ideal_mask, score = refine_circle_and_score(mask)
+            score = circularity_and_completeness(mask)
             if score > best_score:
                 best_score = score
                 best_mask = mask
@@ -160,9 +161,9 @@ class IrisUI(QMainWindow):
 
         self.bin_pupil = best_mask
 
-        proj_y = np.sum(mask // 255, axis=1)
+        proj_y = np.sum(best_mask // 255, axis=1)
         rows = np.where(proj_y > 0)[0]
-        proj_x = np.sum(mask // 255, axis=0)
+        proj_x = np.sum(best_mask // 255, axis=0)
         cols = np.where(proj_x > 0)[0]
         if rows.size == 0 or cols.size == 0:
             self.pcen = (0, 0); self.prad = 0; return
