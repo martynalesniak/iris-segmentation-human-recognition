@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.lib._stride_tricks_impl import as_strided
 
 # -------------------- basic helpers -------------------------------------
 
@@ -213,6 +214,89 @@ def horizontal_projection(binary, factor):
 def vertical_projection(binary, factor):
     return _projection(binary, axis=0)
 
+def largest_connected_component(bin_img):
+    """Return mask of the largest 8-connected component (pure NumPy)."""
+    h, w = bin_img.shape
+    visited = np.zeros_like(bin_img, dtype=bool)
+    best_sz = 0
+    best_mask = None
+    stack = []
+
+    for y, x in zip(*np.where(bin_img)):
+        if visited[y, x]:
+            continue
+        cur_mask = []
+        stack.append((y, x))
+        visited[y, x] = True
+        while stack:
+            cy, cx = stack.pop()
+            cur_mask.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if (0 <= ny < h and 0 <= nx < w and
+                        not visited[ny, nx] and bin_img[ny, nx]):
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+
+        if len(cur_mask) > best_sz:
+            best_sz = len(cur_mask)
+            best_mask = cur_mask
+
+    mask = np.zeros_like(bin_img, dtype=bool)
+    if best_mask:
+        for y, x in best_mask:
+            mask[y, x] = True
+    return mask
+
+def _apply_kernel(image, kernel, mode='reflect'):
+
+    kernel = np.array(kernel, dtype=np.float32)
+    kh, kw = kernel.shape
+    pad_h, pad_w = kh // 2, kw // 2
+
+    if image.ndim == 2:
+        # Grayscale image
+        padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w)), mode=mode)
+        H, W = image.shape
+        shape = (H, W, kh, kw)
+        strides = padded.strides * 2
+        windows = as_strided(padded, shape=shape, strides=strides)
+        result = np.einsum('ijkl,kl->ij', windows, kernel)
+        return result.clip(0, 255).astype(np.uint8)
+    elif image.ndim == 3:
+        # Color image
+        H, W, C = image.shape
+        padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w), (0, 0)), mode=mode)
+        output = np.empty((H, W, C), dtype=np.float32)
+        for c in range(C):
+            channel = padded[:, :, c]
+            shape = (H, W, kh, kw)
+            strides = channel.strides * 2
+            windows = as_strided(channel, shape=shape, strides=strides)
+            result = np.einsum('ijkl,kl->ij', windows, kernel)
+            output[:, :, c] = result
+        return output.clip(0, 255).astype(np.uint8)
+    else:
+        raise ValueError("Unsupported image shape.")
+    
+
+def sobel_operator(image):
+    sobel_x = np.array([[-1, 0, 1], 
+                         [-2, 0, 2], 
+                         [-1, 0, 1]], dtype=np.float32)
+
+    sobel_y = np.array([[-1, -2, -1], 
+                         [0,  0,  0], 
+                         [1,  2,  1]], dtype=np.float32)
+
+    gx = _apply_kernel(image, sobel_x, mode='reflect')
+    gy = _apply_kernel(image, sobel_y, mode='reflect')
+
+    gradient_magnitude = np.sqrt(gx.astype(np.float32) ** 2 + gy.astype(np.float32) ** 2)
+    
+    return np.clip(gradient_magnitude, 0, 255).astype(np.uint8)
+
 
 # ----------------------- polar helper -----------------------------------
 
@@ -220,3 +304,4 @@ def polar_to_cartesian(r, theta, cx, cy):
     x = int(r * np.cos(theta) + cx)
     y = int(r * np.sin(theta) + cy)
     return x, y
+

@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt
 from operations import (
     grayscale, binarization, erosion, dilatation, opening, closing,
     horizontal_projection, vertical_projection, polar_to_cartesian, close_and_fill, refine_circle_and_score,
-    circularity_and_completeness
+    circularity_and_completeness, largest_connected_component
 )
 
 # ---------------- helper -------------------------------------------------
@@ -110,69 +110,62 @@ class IrisUI(QMainWindow):
         self.labels[slot].setPixmap(pix)
 
     # ------------- pupil processing -------------------------------------
-    @staticmethod
-    def _largest_connected_component(bin_img):
-        """Return mask of the largest 8‑connected component (NumPy only)."""
-        h, w = bin_img.shape
-        visited = np.zeros_like(bin_img, dtype=bool)
-        labels  = np.zeros_like(bin_img, dtype=bool)
-        best_sz = 0; best_mask = None
-        stack = []
-        # iterate over foreground pixels
-        for y, x in zip(*np.where(bin_img)):
-            if visited[y, x]:
-                continue
-            cur_mask = []
-            stack.append((y, x)); visited[y, x] = True
-            while stack:
-                cy, cx = stack.pop(); cur_mask.append((cy, cx))
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and bin_img[ny, nx]:
-                            visited[ny, nx] = True; stack.append((ny, nx))
-            if len(cur_mask) > best_sz:
-                best_sz = len(cur_mask)
-                best_mask = cur_mask
-        mask = np.zeros_like(bin_img, dtype=bool)
-        if best_mask is not None:
-            ys, xs = zip(*best_mask)
-            mask[ys, xs] = True
-        return mask
 
     def _compute_pupil(self):
-
         best_score = 0
         best_mask = None
-        factors = [i/10 for i in range(29, 60, 3)]
+        factors = [i / 10 for i in range(29, 60, 3)]
+        kernel = np.ones((5, 5), np.uint8)
 
+        # Iteracja przez faktory i obliczanie najlepszej maski
         for f in factors:
             raw = binarization(self.orig, factor=f)
-            k = np.ones((5, 5), np.uint8)
-            mask_opening = opening(raw, k)
-            mask_opening_closing = closing(mask_opening, k)
-            mask_opening_closing_llc = self._largest_connected_component(mask_opening_closing)
+            mask_opening = opening(raw, kernel)
+            mask_opening_closing = closing(mask_opening, kernel)
+            mask_opening_closing_llc = largest_connected_component(mask_opening_closing)
             mask = (mask_opening_closing_llc * 255).astype(np.uint8)
             score = circularity_and_completeness(mask)
+            
             if score > best_score:
                 best_score = score
                 best_mask = mask
             print(score, f)
 
-        self.bin_pupil = best_mask
-
+        # Teraz tworzymy okrąg na podstawie najlepszej maski
         proj_y = np.sum(best_mask // 255, axis=1)
         rows = np.where(proj_y > 0)[0]
         proj_x = np.sum(best_mask // 255, axis=0)
         cols = np.where(proj_x > 0)[0]
+        
         if rows.size == 0 or cols.size == 0:
-            self.pcen = (0, 0); self.prad = 0; return
+            self.pcen = (0, 0)
+            self.prad = 0
+            return
+        
+        # Obliczamy środek i promień maski źrenicy
         cy = (rows[0] + rows[-1]) // 2
         ry = (rows[-1] - rows[0]) // 2
         cx = (cols[0] + cols[-1]) // 2
         rx = (cols[-1] - cols[0]) // 2
         self.pcen = (cx, cy)
         self.prad = (ry + rx) // 2
+
+        # --- Tworzenie maski okręgu (czysta NumPy) ---
+        rr, cc = np.ogrid[:best_mask.shape[0], :best_mask.shape[1]]
+        mask_circle = (rr - cy) ** 2 + (cc - cx) ** 2 <= (self.prad + 5) ** 2  # Margin 5 dla rozszerzenia promienia
+        final_mask = np.zeros_like(best_mask, dtype=np.uint8)
+        final_mask[mask_circle] = 255  # Maska binarna z okręgiem
+
+        # Przechowywanie ostatecznej maski źrenicy
+        self.bin_pupil = final_mask
+
+        # Wizualizacja: rysowanie okręgu na obrazie źrenicy
+        self.overlay_pupil = self.orig.copy()
+        cv2.circle(self.overlay_pupil, self.pcen, self.prad, (255, 0, 0), 2)  # Rysowanie czerwonego okręgu źrenicy
+        self.orig_no_pupil = self.orig.copy()
+        rr, cc = np.ogrid[:self.orig.shape[0], :self.orig.shape[1]]
+        mask_circle = (rr - cy) ** 2 + (cc - cx) ** 2 <= (self.prad + 5) ** 2  # Używamy promienia źrenicy + margin
+        self.orig_no_pupil[mask_circle] = 255 
 
     def _compute_pupil_overlay(self):
         if self.pcen is None: self._compute_pupil()
@@ -183,26 +176,71 @@ class IrisUI(QMainWindow):
 # ------------- iris processing -------------------------------------- --------------------------------------
     def _compute_iris(self):
         if self.pcen is None: self._compute_pupil()
-        # estimate iris radius as 3× pupil and threshold on ring only
-        est_irad = int(self.prad * 3.0)
-        ring_bin = binarization_ring(self.orig, self.pcen, int(self.prad * 1.2), est_irad, factor=2.5)
-        # clean lashes via opening-closing using 7×7 kernel
-        k = np.ones((5, 5), np.uint8)
-        opened = dilatation(erosion(ring_bin, k), k)
-        closed = erosion(dilatation(opened, k), k)
-        self.bin_iris = closed
-        # cy, ry = horizontal_projection(self.bin_iris, None)
-        # cx, rx = vertical_projection(self.bin_iris, None)
-        # self.irad = (ry + rx) // 2
+        
+        # Estymacja promienia tęczówki jako 3x promień źrenicy (powiększenie o 3x)
+        est_irad = int(self.prad * 2.0)
+        
+        best_score = 0
+        best_mask = None
+        factors = [i / 10 for i in range(5, 30, 3)]
+        kernel = np.ones((5, 5), np.uint8)
 
-        proj_y = np.sum(closed // 255, axis=1)
+        # Iteracja przez faktory, aby znaleźć najlepszą maskę tęczówki
+        for f in factors:
+            # Binarne progowanie w pierścieniu między źrenicą a tęczówką
+            ring_bin = binarization_ring(self.orig_no_pupil, self.pcen, int(self.prad * 1.2), est_irad, factor=f)
+            
+            # Operacje morfologiczne: oczyszczenie przez otwieranie i zamykanie
+            opened = dilatation(erosion(ring_bin, kernel), kernel)
+            closed = erosion(dilatation(opened, kernel), kernel)
+            
+            # Sprawdzenie największej składowej połączonej
+            lcc = largest_connected_component(closed)
+            mask = (lcc * 255).astype(np.uint8)
+            
+            # Ocena skuteczności maski na podstawie cyrkularności
+            score = circularity_and_completeness(mask)
+            if score > best_score:
+                best_score = score
+                best_mask = mask
+            print(score, f)
+        
+        # Przechowywanie najlepszej maski tęczówki
+        self.bin_iris = best_mask
+
+        # Obliczanie średnicy tęczówki (na podstawie projekcji poziomej i pionowej)
+        proj_y = np.sum(best_mask // 255, axis=1)
         rows = np.where(proj_y > 0)[0]
-        proj_x = np.sum(closed // 255, axis=0)
+        proj_x = np.sum(best_mask // 255, axis=0)
         cols = np.where(proj_x > 0)[0]
+
+        if rows.size == 0 or cols.size == 0:
+            self.irad = 0
+            return
+
+        # Obliczamy środek i promień tęczówki
+        cy = (rows[0] + rows[-1]) // 2
         ry = (rows[-1] - rows[0]) // 2
+        cx = (cols[0] + cols[-1]) // 2
         rx = (cols[-1] - cols[0]) // 2
 
-        self.irad = (ry + rx) // 2
+        self.irad = (ry + rx) // 2  # Promień tęczówki
+        self.ircen = (cx, cy)  # Środek tęczówki
+
+        # --- Tworzenie maski okręgu (czysta NumPy) ---
+        rr, cc = np.ogrid[:best_mask.shape[0], :best_mask.shape[1]]
+        mask_circle = (rr - cy) ** 2 + (cc - cx) ** 2 <= (self.irad + 5) ** 2  # Margin 5 dla rozszerzenia promienia
+        final_mask = np.zeros_like(best_mask, dtype=np.uint8)
+        final_mask[mask_circle] = 255  # Maska binarna z okręgiem tęczówki
+
+        # Przechowywanie ostatecznej maski tęczówki
+        self.bin_iris = final_mask
+
+        # Wizualizacja: rysowanie okręgu na obrazie tęczówki
+        self.overlay_iris = self.orig.copy()
+        cv2.circle(self.overlay_iris, self.ircen, self.irad, (0, 255, 0), 2)  # Rysowanie zielonego okręgu tęczówki
+
+
 
     def _compute_both_overlay(self):
         if self.irad is None: self._compute_iris()
