@@ -253,7 +253,7 @@ def largest_connected_component(bin_img):
         mask[ys, xs] = True
     return mask
 
-def fit_circle_bottom_anchor(mask, cover_thresh = 0.80, r_min = 5, r_max = None, step = 1, use_perimeter = True, return_largest = True):
+def fit_circle_bottom_anchor(mask, cover_thresh = 0.80, r_min = 5, r_max = 400, step = 1, use_perimeter = True, return_largest = True):
 
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
@@ -264,7 +264,6 @@ def fit_circle_bottom_anchor(mask, cover_thresh = 0.80, r_min = 5, r_max = None,
     yb = ys.max()
     xb = int(np.round(xs[ys == yb].mean()))
 
-    # 2 ─ radius bounds
     H, W = mask.shape
     if r_max is None:
         r_max = int(min(yb, H-1, W-1))

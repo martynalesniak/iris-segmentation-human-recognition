@@ -46,7 +46,7 @@ class IrisUI(QMainWindow):
         self.resize(800, 600)
 
     def _build_ui(self):
-        c = QWidget();
+        c = QWidget()
         self.setCentralWidget(c)
         v = QVBoxLayout(c)
 
@@ -63,10 +63,13 @@ class IrisUI(QMainWindow):
         self.labels = []
         for t in self.TAB_TITLES:
             lab = QLabel(alignment=Qt.AlignCenter)
-            lab.setScaledContents(True)
-            tab = QWidget(); QVBoxLayout(tab).addWidget(lab)
+            lab.setScaledContents(False)
+            tab = QWidget()
+            QVBoxLayout(tab).addWidget(lab)
             self.tabs.addTab(tab, t); self.labels.append(lab)
+
         self.tabs.currentChanged.connect(self.update_tab)
+
 
     def load_image(self):
         p, _ = QFileDialog.getOpenFileName(self, "Select eye image", "", "Images (*.png *.jpg *.jpeg)")
@@ -153,21 +156,24 @@ class IrisUI(QMainWindow):
 
             bin_mask = self.bin_pupil.copy()
 
-            xc, yc, r = fit_circle_bottom_anchor(bin_mask,
+            best = fit_circle_bottom_anchor(bin_mask,
                                                  cover_thresh=0.60,
                                                  r_min=100,
                                                  use_perimeter=True,
-                                                 return_largest=False)
+                                                 return_largest=True)
+            if best is None:
+                print("No circle found")
+            else:
+                xc, yc, r = best
+                print(f"centre=({xc:.1f},{yc:.1f}),  radius={r}")
+                self.pcen = (xc, yc)
+                self.prad = r
 
-            print(f"centre=({xc:.1f},{yc:.1f}),  radius={r}")
-            self.pcen = (xc, yc)
-            self.prad = r
+                if self.tabs.currentIndex() == 2:
+                    self._compute_pupil_overlay()
+                    self.update_tab(2)
 
             self.tabs.setEnabled(True)
-
-            if self.tabs.currentIndex() == 2:
-                self._compute_pupil_overlay()
-                self.update_tab(2)
 
         else:
             pass
