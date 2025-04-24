@@ -1,7 +1,7 @@
 import numpy as np
 from numpy.lib._stride_tricks_impl import as_strided
+import cv2
 
-# -------------------- basic helpers -------------------------------------
 
 def grayscale(image):
     if image.ndim == 2:
@@ -18,9 +18,7 @@ def binarization(image, factor):
     return out
 
 def _logical_shift(img_bool: np.ndarray, dy: int, dx: int) -> np.ndarray:
-    """Return a view of img_bool shifted by (dy,dx) with zero padding."""
     h, w = img_bool.shape
-    # y slice
     if dy < 0:
         ys = slice(0, h + dy)
         yt = slice(-dy, h)
@@ -29,7 +27,6 @@ def _logical_shift(img_bool: np.ndarray, dy: int, dx: int) -> np.ndarray:
         yt = slice(0, h - dy)
     else:
         ys = yt = slice(0, h)
-    # x slice
     if dx < 0:
         xs = slice(0, w + dx)
         xt = slice(-dx, w)
@@ -69,49 +66,8 @@ def opening(mask, k):
 def closing(mask, k):
     return erosion(dilatation(mask, k), k)
 
-def refine_circle_and_score(bin_mask: np.ndarray):
-    if bin_mask.ndim != 2:
-        raise ValueError("binary mask must be 2‑D")
-
-    fg = bin_mask // 255
-    if fg.sum() == 0:
-        h, w = bin_mask.shape
-        return np.zeros((h, w), dtype=np.uint8), 0.0
-
-    # centre via projections (same method as UI)
-    proj_y = np.sum(fg, axis=1)
-    rows = np.where(proj_y > 0)[0]
-    proj_x = np.sum(fg, axis=0)
-    cols = np.where(proj_x > 0)[0]
-    cy = (rows[0] + rows[-1]) // 2
-    cx = (cols[0] + cols[-1]) // 2
-    ry = (rows[-1] - rows[0]) / 2.0
-    rx = (cols[-1] - cols[0]) / 2.0
-    r  = (ry + rx) / 2.0
-
-    # build ideal circle mask (NumPy broadcasting)
-    h, w = bin_mask.shape
-    yy, xx = np.ogrid[:h, :w]
-    circle = ((xx - cx) ** 2 + (yy - cy) ** 2) <= r ** 2
-    ideal = circle.astype(np.uint8) * 255
-
-    # Jaccard score (intersection / union)
-    inter = np.logical_and(fg, circle).sum()
-    union = np.logical_or(fg, circle).sum()
-    score = inter / union if union else 0.0
-
-    return ideal, score
-
-
-import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
-
-
 def extract_contour(binary):
-    """
-    Vectorized: external contour = foreground pixels (A==1)
-    that have at least one 4‐neighbour background pixel.
-    """
+
     A = (binary > 0).astype(np.uint8)
     up    = np.pad(A, ((1,0),(0,0)))[:-1, :]
     down  = np.pad(A, ((0,1),(0,0)))[1: , :]
@@ -121,76 +77,24 @@ def extract_contour(binary):
     return (A==1) & bg_n
 
 def circularity_and_completeness(binary):
-    """
-    Returns a combined score ∈ [0,1]:
-      score = (min_r/max_r) * angular_coverage.
 
-    - min_r/max_r penalizes radial irregularity.
-    - angular_coverage = 1 - (largest empty angle)/(2π).
-    """
     cnt = extract_contour(binary)
     ys, xs = np.nonzero(cnt)
     if xs.size < 5:
         return 0.0
 
-    # centroid
     cx, cy = xs.mean(), ys.mean()
-    # radii
     rs = np.hypot(xs - cx, ys - cy)
     rmin, rmax = rs.min(), rs.max()
     circ = rmin/rmax
 
-    # angles in [0,2π)
     ang = np.mod(np.arctan2(ys-cy, xs-cx), 2*np.pi)
     sa = np.sort(ang)
-    # compute gaps between successive angles (with wrap)
     gaps = np.diff(np.concatenate([sa, sa[:1] + 2*np.pi]))
     largest_gap = gaps.max()
     coverage = 1 - largest_gap/(2*np.pi)
 
     return float(circ * coverage)
-
-
-
-# --- Usage Example ---
-# import imageio
-# bin1 = imageio.imread('/mnt/data/7d833d2a-537f-4cb3-ab47-e06c4293dcf4.png')
-# bin2 = imageio.imread('/mnt/data/c0ee743b-9937-4778-908f-301bd0eaf16e.png')
-# print("Score1:", circle_score(bin1))
-# print("Score2:", circle_score(bin2))
-
-
-# -------------------- hole-filling & closing ----------------------------
-def close_and_fill(binary: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Morphological closing (dilation→erosion) then flood-fill to fill holes."""
-    closed = erosion(dilatation(binary, kernel), kernel)
-
-    # flood-fill 0-pixels connected to the border → background mask
-    h, w = closed.shape
-    bg = np.zeros_like(closed, dtype=bool)
-    stack = [(0, x) for x in range(w) if closed[0, x] == 0] + \
-            [(h-1, x) for x in range(w) if closed[h-1, x] == 0] + \
-            [(y, 0) for y in range(h) if closed[y, 0] == 0] + \
-            [(y, w-1) for y in range(h) if closed[y, w-1] == 0]
-
-    while stack:
-        y, x = stack.pop()
-        if bg[y, x]:
-            continue
-        bg[y, x] = True
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and closed[ny, nx] == 0 and not bg[ny, nx]:
-                    stack.append((ny, nx))
-
-    holes = (~bg) & (closed == 0)
-    filled = closed.copy()
-    filled[holes] = 255
-    return filled
-
-
-# -------------------- projection helpers --------------------------------
 
 def _projection(binary, axis):
     proj = np.sum(binary // 255, axis=axis)
@@ -207,48 +111,6 @@ def _projection(binary, axis):
     return center, radius
 
 
-def horizontal_projection(binary, factor):
-    return _projection(binary, axis=1)
-
-
-def vertical_projection(binary, factor):
-    return _projection(binary, axis=0)
-
-def largest_connected_component(bin_img):
-    """Return mask of the largest 8-connected component (pure NumPy)."""
-    h, w = bin_img.shape
-    visited = np.zeros_like(bin_img, dtype=bool)
-    best_sz = 0
-    best_mask = None
-    stack = []
-
-    for y, x in zip(*np.where(bin_img)):
-        if visited[y, x]:
-            continue
-        cur_mask = []
-        stack.append((y, x))
-        visited[y, x] = True
-        while stack:
-            cy, cx = stack.pop()
-            cur_mask.append((cy, cx))
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    ny, nx = cy + dy, cx + dx
-                    if (0 <= ny < h and 0 <= nx < w and
-                        not visited[ny, nx] and bin_img[ny, nx]):
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-
-        if len(cur_mask) > best_sz:
-            best_sz = len(cur_mask)
-            best_mask = cur_mask
-
-    mask = np.zeros_like(bin_img, dtype=bool)
-    if best_mask:
-        for y, x in best_mask:
-            mask[y, x] = True
-    return mask
-
 def _apply_kernel(image, kernel, mode='reflect'):
 
     kernel = np.array(kernel, dtype=np.float32)
@@ -256,7 +118,7 @@ def _apply_kernel(image, kernel, mode='reflect'):
     pad_h, pad_w = kh // 2, kw // 2
 
     if image.ndim == 2:
-        # Grayscale image
+
         padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w)), mode=mode)
         H, W = image.shape
         shape = (H, W, kh, kw)
@@ -279,29 +141,151 @@ def _apply_kernel(image, kernel, mode='reflect'):
         return output.clip(0, 255).astype(np.uint8)
     else:
         raise ValueError("Unsupported image shape.")
-    
-
-def sobel_operator(image):
-    sobel_x = np.array([[-1, 0, 1], 
-                         [-2, 0, 2], 
-                         [-1, 0, 1]], dtype=np.float32)
-
-    sobel_y = np.array([[-1, -2, -1], 
-                         [0,  0,  0], 
-                         [1,  2,  1]], dtype=np.float32)
-
-    gx = _apply_kernel(image, sobel_x, mode='reflect')
-    gy = _apply_kernel(image, sobel_y, mode='reflect')
-
-    gradient_magnitude = np.sqrt(gx.astype(np.float32) ** 2 + gy.astype(np.float32) ** 2)
-    
-    return np.clip(gradient_magnitude, 0, 255).astype(np.uint8)
 
 
-# ----------------------- polar helper -----------------------------------
+def detect_iris_from_pupil(gray_image, pupil_center, pupil_radius):
+    h, w = gray_image.shape
+    max_search_radius = int(pupil_radius * 3.2)
 
-def polar_to_cartesian(r, theta, cx, cy):
-    x = int(r * np.cos(theta) + cx)
-    y = int(r * np.sin(theta) + cy)
-    return x, y
+    num_angles = 36
+    angles = np.linspace(0, 2*np.pi, num_angles, endpoint=False)
+    iris_radius_estimates = []
 
+    for angle in angles:
+        dx, dy = np.cos(angle), np.sin(angle)
+        intensity_profile = []
+        radius_values = []
+
+        for r in range(pupil_radius + 5, max_search_radius, 2):
+            x = int(pupil_center[0] + dx * r)
+            y = int(pupil_center[1] + dy * r)
+
+            if 0 <= x < w and 0 <= y < h:
+                intensity = gray_image[y, x]
+                intensity_profile.append(intensity)
+                radius_values.append(r)
+
+        if len(intensity_profile) > 10:
+            smoothed = np.convolve(intensity_profile, np.ones(5)/5, mode='valid')
+            gradient = np.gradient(smoothed)
+
+            search_range = len(gradient) // 3
+            if search_range < len(gradient):
+                max_grad_idx = search_range + np.argmax(np.abs(gradient[search_range:]))
+                if max_grad_idx < len(radius_values):
+                    iris_radius_estimates.append(radius_values[max_grad_idx])
+
+    if iris_radius_estimates:
+        sorted_estimates = sorted(iris_radius_estimates)
+        num_to_remove = len(sorted_estimates) // 5
+        filtered_estimates = sorted_estimates[num_to_remove:-num_to_remove] if num_to_remove > 0 else sorted_estimates
+
+        iris_radius = int(np.mean(filtered_estimates))
+        return iris_radius
+    else:
+        return int(pupil_radius * 2.5)
+
+
+# def remove_eyelids(image, iris_center, iris_radius):
+#     result = image.copy()
+#     h, w = image.shape[:2]
+#
+#     eyelid_mask = np.zeros((h, w), dtype=np.uint8)
+#     angle_step = 20
+#
+#     for angle in range(-60, 61, angle_step):
+#         rad = np.radians(angle)
+#         start_x = int(iris_center[0] + (iris_radius * 0.3) * np.cos(rad))
+#         start_y = int(iris_center[1] + (iris_radius * 0.3) * np.sin(rad))
+#         end_x = int(iris_center[0] + iris_radius * np.cos(rad))
+#         end_y = int(iris_center[1] + iris_radius * np.sin(rad))
+#
+#         cv2.line(eyelid_mask, (start_x, start_y), (end_x, end_y), 255, 2)
+#
+#     for angle in range(120, 241, angle_step):
+#         rad = np.radians(angle)
+#         start_x = int(iris_center[0] + (iris_radius * 0.3) * np.cos(rad))
+#         start_y = int(iris_center[1] + (iris_radius * 0.3) * np.sin(rad))
+#         end_x = int(iris_center[0] + iris_radius * np.cos(rad))
+#         end_y = int(iris_center[1] + iris_radius * np.sin(rad))
+#
+#         cv2.line(eyelid_mask, (start_x, start_y), (end_x, end_y), 255, 2)
+#
+#     kernel = np.ones((7, 7), np.uint8)
+#     eyelid_mask = cv2.dilate(eyelid_mask, kernel, iterations=3)
+#
+#     if len(image.shape) > 2:
+#         eyelid_mask_color = cv2.merge([eyelid_mask, eyelid_mask, eyelid_mask])
+#
+#         white_bg = np.ones_like(result) * 255
+#         result = np.where(eyelid_mask_color > 0, white_bg, result)
+#     else:
+#         result[eyelid_mask > 0] = 255
+#
+#     return result, cv2.bitwise_not(eyelid_mask)
+
+
+def largest_connected_component(bin_img):
+
+    h, w = bin_img.shape
+    visited = np.zeros_like(bin_img, dtype=bool)
+    best_sz = 0; best_mask = None
+    stack = []
+
+    for y, x in zip(*np.where(bin_img)):
+        if visited[y, x]:
+            continue
+        cur_mask = []
+        stack.append((y, x)); visited[y, x] = True
+        while stack:
+            cy, cx = stack.pop(); cur_mask.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and bin_img[ny, nx]:
+                        visited[ny, nx] = True; stack.append((ny, nx))
+        if len(cur_mask) > best_sz:
+            best_sz = len(cur_mask)
+            best_mask = cur_mask
+    mask = np.zeros_like(bin_img, dtype=bool)
+    if best_mask is not None:
+        ys, xs = zip(*best_mask)
+        mask[ys, xs] = True
+    return mask
+
+def fit_circle_bottom_anchor(mask, cover_thresh = 0.80, r_min = 5, r_max = None, step = 1, use_perimeter = True, return_largest = True):
+
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return None
+    yb = ys.max()
+    xb = int(np.round(xs[ys == yb].mean()))
+
+    # 2 ─ radius bounds
+    H, W = mask.shape
+    if r_max is None:
+        r_max = int(min(yb, H-1, W-1))
+
+    yy, xx = np.indices(mask.shape)
+    best = None
+    for r in range(r_min, r_max + 1, step):
+        yc = yb - r
+        if yc < 0:
+            break
+
+        if use_perimeter:
+            band = np.abs(np.hypot(xx - xb, yy - yc) - r) <= 0.5
+        else:
+            band = np.hypot(xx - xb, yy - yc) <= r
+
+        overlap = (band & (mask > 0)).sum() / band.sum()
+
+        if overlap >= cover_thresh:
+            best = (xb, yc, r)
+            if not return_largest:
+                return best
+
+    return best
